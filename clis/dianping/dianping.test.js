@@ -177,6 +177,16 @@ describe('dianping adapter — async city resolver', () => {
         expect(goto).toHaveBeenCalledWith('https://www.dianping.com/citylist');
     });
 
+    it('throws CommandExecutionError when citylist renders without city anchors', async () => {
+        const goto = vi.fn().mockResolvedValue(undefined);
+        const evaluate = vi.fn().mockResolvedValueOnce({});
+        const page = { goto, evaluate, wait: vi.fn() };
+
+        await expect(resolveCityIdAsync(page, '汕头')).rejects.toThrow(CommandExecutionError);
+        expect(goto).toHaveBeenCalledTimes(1);
+        expect(goto).toHaveBeenCalledWith('https://www.dianping.com/citylist');
+    });
+
     it('throws CommandExecutionError when the per-city page lacks a /search/keyword/{id}/ link', async () => {
         const goto = vi.fn().mockResolvedValue(undefined);
         const evaluate = vi.fn().mockResolvedValueOnce(null);
@@ -217,16 +227,22 @@ describe('dianping adapter — async city resolver', () => {
     it('extractCityIdFromPage pulls the cityId from the first /search/keyword/{id}/ link', () => {
         const dom = new JSDOM(`
             <html><body>
+                <script>window.bad = "/search/keyword/999/";</script>
+                <a href="https://example.com/search/keyword/888/0_x">wrong host</a>
+                <a href="https://www.dianping.com.evil.com/search/keyword/666/0_x">host suffix</a>
+                <a href="http://www.dianping.com/search/keyword/777/0_x">non-https</a>
                 <a href="/search/keyword/207/0_%E5%88%BA%E8%BA%AB">刺身</a>
                 <a href="/search/category/207/10">美食</a>
             </body></html>
-        `);
+        `, { url: 'https://www.dianping.com/shantou' });
         globalThis.document = dom.window.document;
+        globalThis.location = dom.window.location;
 
         try {
             expect(extractCityIdFromPage()).toBe(207);
         } finally {
             delete globalThis.document;
+            delete globalThis.location;
         }
     });
 

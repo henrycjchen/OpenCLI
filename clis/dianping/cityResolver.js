@@ -110,6 +110,11 @@ export async function resolveCityIdAsync(page, cityArg) {
 async function lookupPinyinFromCitylist(page, chineseName) {
     await page.goto('https://www.dianping.com/citylist');
     const map = await page.evaluate(`(${buildCitylistMap.toString()})()`);
+    if (!map || typeof map !== 'object' || Object.keys(map).length === 0) {
+        throw new CommandExecutionError(
+            'dianping citylist did not render any city anchors; cannot resolve Chinese city names',
+        );
+    }
     if (map && typeof map === 'object' && map[chineseName]) {
         return String(map[chineseName]).toLowerCase();
     }
@@ -159,9 +164,22 @@ async function fetchCityIdByPinyin(page, pinyin) {
  * scope so the same code is exercised in JSDOM tests via toString().
  */
 export function extractCityIdFromPage() {
-    const html = document.body ? document.body.innerHTML : '';
-    const m = String(html).match(/\/search\/keyword\/(\d+)\//);
-    if (!m) return null;
-    const n = Number(m[1]);
-    return Number.isInteger(n) && n > 0 ? n : null;
+    const baseHref = (typeof location !== 'undefined' && location.href) || 'https://www.dianping.com/';
+    const anchors = document.querySelectorAll('a[href]');
+    for (const a of anchors) {
+        const hrefRaw = a.getAttribute('href') || '';
+        let url;
+        try {
+            url = new URL(hrefRaw, baseHref);
+        } catch {
+            continue;
+        }
+        if (url.protocol !== 'https:') continue;
+        if (url.hostname !== 'www.dianping.com' && url.hostname !== 'dianping.com') continue;
+        const m = url.pathname.match(/^\/search\/keyword\/(\d+)(?:\/|$)/);
+        if (!m) continue;
+        const n = Number(m[1]);
+        if (Number.isInteger(n) && n > 0) return n;
+    }
+    return null;
 }

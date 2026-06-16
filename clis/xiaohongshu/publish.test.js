@@ -568,7 +568,7 @@ describe('xiaohongshu publish', () => {
             },
         ]);
     });
-    it('does not treat 保存成功 alone as a publish success signal', async () => {
+    it('fails when publish success cannot be verified', async () => {
         const cmd = getRegistry().get('xiaohongshu/publish');
         expect(cmd?.func).toBeTypeOf('function');
         const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-xhs-publish-'));
@@ -606,19 +606,13 @@ describe('xiaohongshu publish', () => {
             }
             throw new Error(`Unhandled evaluate call: ${code.slice(0, 120)}`);
         });
-        const result = await cmd.func(page, {
+        await expect(cmd.func(page, {
             title: '发布成功提示',
             content: '发布提示不该复用草稿成功',
             images: imagePath,
             topics: '',
             draft: false,
-        });
-        expect(result).toEqual([
-            {
-                status: '⚠️ 操作完成，请在浏览器中确认',
-                detail: '"发布成功提示" · 1张图片 · https://creator.xiaohongshu.com/publish/publish?from=menu_left&target=image',
-            },
-        ]);
+        })).rejects.toThrow(CommandExecutionError);
     });
     it('attaches topics via Enter to accept the inline suggestion (shadow-DOM dropdown)', async () => {
         const cmd = getRegistry().get('xiaohongshu/publish');
@@ -932,6 +926,8 @@ describe('xiaohongshu publish 文字配图 flow', () => {
                 const want = code.match(/const want = "([^"]+)"/)?.[1] ?? '';
                 return { ok: true, styles, found: styles.includes(want) };
             }
+            if (code.includes('__opencli_xhs_composer_media_count'))
+                return { ok: true, count: 9 };
             // wait-for-edit-form poll
             if (code.includes('const sels =') && code.includes('for (const sel of sels)'))
                 return true;
@@ -1026,6 +1022,7 @@ describe('xiaohongshu publish 文字配图 flow', () => {
             if (code.includes('__opencli_xhs_card_count')) return { ok: true, count: 9, activeEmpty: true };
             if (code.includes('__opencli_xhs_preview_ready')) return { ok: true };
             if (code.includes('__opencli_xhs_card_text')) return { ok: true, text: 'x' };
+            if (code.includes('__opencli_xhs_composer_media_count')) return { ok: true, count: 2 };
             if (code.includes('document.querySelector(sels)') && code.includes('return el ? sels : null')) return IMAGE_INPUT_SELECTOR_RESULT;
             if (code.includes('[class*="upload"][class*="progress"]')) return false;
             if (code.includes('const sels =') && code.includes('for (const sel of sels)')) return true;
@@ -1086,6 +1083,7 @@ describe('xiaohongshu publish 文字配图 flow', () => {
                 const want = code.match(/const want = "([^"]+)"/)?.[1] ?? '';
                 return { ok: true, styles, found: styles.includes(want) };
             }
+            if (code.includes('__opencli_xhs_composer_media_count')) return { ok: true, count: 1 };
             if (code.includes('const sels =') && code.includes('for (const sel of sels)')) return true;
             if (code.includes('__opencli_xhs_fill_phase') && code.includes('"locate"')) return { ok: true, sel: 'x', kind: 'input' };
             if (code.includes('__opencli_xhs_fill_phase') && code.includes('"apply"')) return { ok: true, actual: code.includes('标题') ? 't' : 'c' };
@@ -1098,18 +1096,42 @@ describe('xiaohongshu publish 文字配图 flow', () => {
         expect(rows[0].detail).toContain('(边框)');
     });
 
-    it('falls back to 基础 (no abort) when the requested style is not on the page', async () => {
+    it('fails when the requested style is not on the page', async () => {
         const cmd = getCmd();
         const capture = { clicks: [] };
         const insertText = vi.fn().mockResolvedValue(undefined);
         // createTextImagePage reports styles 基础/插图/美漫/备忘/边框/清新 — "霓虹" is absent.
         const page = createTextImagePage({ insertText, capture });
-        const rows = await cmd.func(page, { title: 't', content: 'c', 'card-text': '卡片', 'card-style': '霓虹' });
-        // Did not abort, never clicked the missing style, and did not advertise it.
+        await expect(
+            cmd.func(page, { title: 't', content: 'c', 'card-text': '卡片', 'card-style': '霓虹' })
+        ).rejects.toThrow(CommandExecutionError);
         expect(capture.clicks).not.toContain('霓虹');
-        expect(rows[0].detail).not.toContain('霓虹');
-        // Fell back to default 基础, so no style suffix is shown.
-        expect(rows[0].detail).not.toContain('(基础)');
-        expect(rows[0].status).toContain('发布成功');
+    });
+
+    it('fails when generated cards do not appear as composer media', async () => {
+        const cmd = getCmd();
+        const capture = { clicks: [] };
+        const insertText = vi.fn().mockResolvedValue(undefined);
+        const page = createConditionalPageMock((code) => {
+            if (code.includes('location.href')) return 'https://creator.xiaohongshu.com/publish/publish?from=menu_left';
+            if (code.includes("const targets = ['上传图文', '图文', '图片']")) return { ok: true, target: '上传图文', text: '上传图文' };
+            if (code.includes('hasTitleInput') && code.includes('hasVideoSurface'))
+                return { state: 'image_surface', hasTitleInput: false, hasImageInput: true, hasVideoSurface: false };
+            if (code.includes('__opencli_xhs_click_label')) {
+                capture.clicks.push(code.match(/wantLabel:\s*"([^"]+)"/)?.[1] ?? 'unknown');
+                return { ok: true };
+            }
+            if (code.includes('__opencli_xhs_focus_card')) return { ok: true };
+            if (code.includes('__opencli_xhs_card_count')) return { ok: true, count: 9, activeEmpty: true };
+            if (code.includes('__opencli_xhs_preview_ready')) return { ok: true };
+            if (code.includes('__opencli_xhs_card_text')) return { ok: true, text: 'x' };
+            if (code.includes('__opencli_xhs_composer_media_count')) return { ok: true, count: 0 };
+            if (code.includes('const sels =') && code.includes('for (const sel of sels)')) return true;
+            return null;
+        }, { insertText });
+
+        await expect(
+            cmd.func(page, { title: 't', content: 'c', 'card-text': '卡片' })
+        ).rejects.toThrow(/generated images/);
     });
 });

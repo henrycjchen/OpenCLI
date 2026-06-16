@@ -27,10 +27,10 @@ const CARD_TEXT_DELIM = '|||';
 const DEFAULT_CARD_STYLE = '基础';
 // Example styles for help text only — the real options are read live from the
 // (virtualized, content-dependent) 预览图片 strip at runtime, so this list is NOT
-// used to validate input; an unavailable style falls back to 基础.
+// used to validate input; an unavailable requested style fails before submit.
 // 文字配图 --card-style catalog: each style name → the content it suits.
 // Styles are read live from the page at runtime (see selectCardStyle); this list
-// only powers --help, and an unmatched style falls back to DEFAULT_CARD_STYLE.
+// only powers --help, and an unmatched requested style is a typed failure.
 const CARD_STYLE_GUIDE = [
     ['基础', '默认兜底，万能'],
     ['边框', '金句/要点卡'],
@@ -910,11 +910,8 @@ async function fillCard(page, text, index) {
  * whitelist — XHS adds/removes styles over time). The strip is located by
  * anchoring on a known seed label (e.g. 基础) rather than a volatile class name.
  *
- * If the requested style is not among the on-page options (or the click fails),
- * we keep the preselected 基础 and continue instead of aborting the publish.
- *
- * Returns the style that actually took effect (the requested one, or
- * DEFAULT_CARD_STYLE when we fell back).
+ * If the caller requested a style, it is a write-side postcondition: either
+ * that style is available and clicked, or publishing fails before submit.
  */
 async function selectCardStyle(page, styleName) {
     if (!styleName || styleName === DEFAULT_CARD_STYLE)
@@ -925,7 +922,7 @@ async function selectCardStyle(page, styleName) {
     // (".cover-list-container-wrapper"), accumulating every label seen; stop as
     // soon as the requested style appears and scroll it into view so the
     // subsequent click lands. XHS also shows a content-dependent subset, so the
-    // real options vary per note — hence no whitelist, with 基础 as the fallback.
+    // real options vary per note — hence no static whitelist.
     const available = unwrapBrowserResult(await page.evaluate(`
     (async () => {
       const __opencli_xhs_card_styles = true;
@@ -957,18 +954,63 @@ async function selectCardStyle(page, styleName) {
     })()
   `));
     if (!available?.found) {
-        console.warn(`[warn] 文字配图: style "${styleName}" not available for this content `
+        throw new CommandExecutionError(`文字配图: requested style "${styleName}" is not available for this content `
             + `(options: ${(available?.styles || []).join(' / ') || 'none'}). `
-            + `Falling back to ${DEFAULT_CARD_STYLE}.`);
-        return DEFAULT_CARD_STYLE;
+            + `Choose an available style or omit --card-style to use ${DEFAULT_CARD_STYLE}.`);
     }
     const clicked = await clickByText(page, styleName);
     if (!clicked?.ok) {
-        console.warn(`[warn] 文字配图: could not click style "${styleName}"; falling back to ${DEFAULT_CARD_STYLE}.`);
-        return DEFAULT_CARD_STYLE;
+        throw new CommandExecutionError(`文字配图: could not click requested style "${styleName}".`);
     }
     await page.wait({ time: 0.6 });
     return styleName;
+}
+/**
+ * Count visible media in the current editor/composer. Text-image generation must
+ * produce real image cards before we fill title/body or submit; otherwise a
+ * no-op 生成图片 / 下一步 sequence can publish the wrong draft surface.
+ */
+async function currentComposerMediaCount(page) {
+    const result = await page.evaluate(`
+    (() => {
+      const __opencli_xhs_composer_media_count = true;
+      const visible = (el) => {
+        if (!el || el.offsetParent === null) return false;
+        const r = el.getBoundingClientRect();
+        return r.width >= 48 && r.height >= 48;
+      };
+      const titleSelectors = ${JSON.stringify(TITLE_SELECTORS)};
+      const titleEl = titleSelectors
+        .map((sel) => Array.from(document.querySelectorAll(sel)))
+        .flat()
+        .find((el) => visible(el));
+      const root = titleEl?.closest('form, [class*="publish"], [class*="editor"], [class*="note"]') || document.body;
+      const seen = new Set();
+      let count = 0;
+      for (const el of Array.from(root.querySelectorAll('img, video, canvas, [style*="background-image"]'))) {
+        if (!visible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const src = el.currentSrc || el.src || el.getAttribute('src') || el.style?.backgroundImage || '';
+        const key = src || String(Math.round(rect.left)) + ':' + String(Math.round(rect.top));
+        if (seen.has(key)) continue;
+        seen.add(key);
+        count += 1;
+      }
+      return { ok: true, count };
+    })()
+  `);
+    return unwrapBrowserResult(result);
+}
+async function assertComposerMediaCount(page, expectedCount, label) {
+    const state = await currentComposerMediaCount(page);
+    if (!state || typeof state.count !== 'number') {
+        throw new CommandExecutionError(`${label}: could not verify current composer media count`);
+    }
+    if (state.count < expectedCount) {
+        await page.screenshot({ path: '/tmp/xhs_publish_media_debug.png' });
+        throw new CommandExecutionError(`${label}: expected at least ${expectedCount} visible media item(s), got ${state.count}. ` +
+            'Debug screenshot: /tmp/xhs_publish_media_debug.png');
+    }
 }
 /**
  * Drive the full 文字配图 sub-flow: entry → type cards → 生成图片 → pick style → 下一步.
@@ -1099,7 +1141,7 @@ cli({
         { name: 'title', required: true, help: '笔记标题 (最多20字)' },
         { name: 'images', required: false, help: '图片路径，逗号分隔，最多9张 (jpg/png/gif/webp)' },
         { name: 'card-text', required: false, help: `文字配图卡片文字，多张卡片用 ${CARD_TEXT_DELIM} 分隔，卡内换行用 \\n` },
-        { name: 'card-style', required: false, help: `文字配图卡片样式，运行时按页面实际选项匹配，找不到回退${DEFAULT_CARD_STYLE}。可选: ${CARD_STYLE_GUIDE.map(([n, s]) => `${n}(${s})`).join(' ')}` },
+        { name: 'card-style', required: false, help: `文字配图卡片样式，运行时按页面实际选项匹配；找不到会失败。省略时使用${DEFAULT_CARD_STYLE}。可选: ${CARD_STYLE_GUIDE.map(([n, s]) => `${n}(${s})`).join(' ')}` },
         { name: 'topics', required: false, help: '话题标签，逗号分隔，不含 # 号' },
         { name: 'draft', type: 'bool', default: false, help: '保存为草稿，不直接发布' },
     ],
@@ -1181,6 +1223,9 @@ cli({
             throw new CommandExecutionError('Editing form did not appear after image acquisition. The page layout may have changed. ' +
                 'Debug screenshot: /tmp/xhs_publish_form_debug.png');
         }
+        if (isTextImage) {
+            await assertComposerMediaCount(page, cards.length, '文字配图 generated images');
+        }
         // ── Step 3c: In text-image mode, optionally append uploaded images ────────
         if (isTextImage && absImagePaths.length > 0) {
             const upload = await uploadImages(page, absImagePaths);
@@ -1191,6 +1236,7 @@ cli({
             }
             await page.wait({ time: UPLOAD_SETTLE_MS / 1_000 });
             await waitForUploads(page);
+            await assertComposerMediaCount(page, cards.length + absImagePaths.length, '文字配图 appended images');
         }
         // ── Step 4: Fill title ─────────────────────────────────────────────────────
         await fillField(page, TITLE_SELECTORS, title, 'title');
@@ -1349,9 +1395,13 @@ cli({
         const navigatedAway = !finalUrl.includes('/publish/publish');
         const isSuccess = successMsg.length > 0 || navigatedAway;
         const verb = isDraft ? '暂存成功' : '发布成功';
+        if (!isSuccess) {
+            throw new CommandExecutionError(`${verb} could not be verified: no success marker or post-submit navigation was observed. ` +
+                (finalUrl ? `Current URL: ${finalUrl}` : 'Current URL was empty.'));
+        }
         return [
             {
-                status: isSuccess ? `✅ ${verb}` : '⚠️ 操作完成，请在浏览器中确认',
+                status: `✅ ${verb}`,
                 detail: [
                     `"${title}"`,
                     isTextImage
